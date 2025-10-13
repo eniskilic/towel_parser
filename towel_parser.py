@@ -1,500 +1,321 @@
 import io
 import re
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Tuple, Optional
-from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Dict
+import streamlit as st
 import pdfplumber
 import pandas as pd
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import landscape
 from reportlab.lib.units import inch
 from reportlab.lib import colors
-import streamlit as st
 
 # ======================================================
 # CONFIG
 # ======================================================
-st.set_page_config(page_title="Amazon Towel Orders — Parser & 6x4 Labels", layout="wide")
+st.set_page_config(page_title="Amazon Towel Orders — Landscape Labels", layout="wide")
+
+# English → Spanish thread-color dictionary
+THREAD_COLOR_ES = {
+    "White": "Blanco", "Black": "Negro", "Gold": "Dorado", "Silver": "Plateado",
+    "Red": "Rojo", "Blue": "Azul", "Navy": "Azul Marino", "Light Blue": "Azul Claro",
+    "Green": "Verde", "Pink": "Rosa", "Hot Pink": "Rosa Fucsia", "Lilac": "Lila",
+    "Purple": "Morado", "Yellow": "Amarillo", "Beige": "Beige", "Brown": "Marrón",
+    "Gray": "Gris", "Grey": "Gris", "Orange": "Naranja", "Teal": "Verde Azulado",
+    "Ivory": "Marfil",
+}
+
+PRODUCT_TYPES = {
+    "Set-6Pcs": {
+        "label": "6-Piece Towel Set",
+        "pieces": [
+            ("First Washcloth", "Small"), ("Second Washcloth", "Small"),
+            ("First Hand Towel", "Medium"), ("Second Hand Towel", "Medium"),
+            ("First Bath Towel", "Large"), ("Second Bath Towel", "Large")
+        ],
+        "plural_word": "Sets",
+    },
+    "Set-3Pcs": {
+        "label": "3-Piece Towel Set",
+        "pieces": [
+            ("Washcloth", "Small"), ("Hand Towel", "Medium"), ("Bath Towel", "Large")
+        ],
+        "plural_word": "Sets",
+    },
+    "HT-2PCS": {
+        "label": "Hand Towels (2)",
+        "pieces": [("First Hand Towel", "Medium"), ("Second Hand Towel", "Medium")],
+        "plural_word": "Sets",
+    },
+    "BT-2Pcs": {
+        "label": "Bath Towels (2)",
+        "pieces": [("First Bath Towel", "Large"), ("Second Bath Towel", "Large")],
+        "plural_word": "Sets",
+    },
+    "BS-1Pcs": {
+        "label": "Bath Sheet (Oversized)",
+        "pieces": [("Oversized Bath Sheet", "XL")],
+        "plural_word": "Qty",
+    },
+}
+
+SKU_PREFIXES = list(PRODUCT_TYPES.keys())
+SKU_REGEX = re.compile(r"\b(" + "|".join([re.escape(p) for p in SKU_PREFIXES]) + r")-([A-Za-z ]+)\b")
+ORDER_ID_REGEX = re.compile(r"\bOrder ID\b[: ]+([A0-9\-]+)", re.IGNORECASE)
+ORDER_DATE_REGEX = re.compile(r"\bOrder Date\b[: ]+([A-Za-z0-9, ]+)")
+SHIPPING_SERVICE_REGEX = re.compile(r"\bShipping Service\b[: ]+([A-Za-z ]+)")
+BUYER_NAME_REGEX = re.compile(r"\bBuyer Name\b[: ]+(.+)")
+SHIP_TO_REGEX = re.compile(r"Ship To:\s*(.+)")
+FONT_REGEX = re.compile(r"(?:Choose Your Font|Font)\s*[:\-]\s*(.+)")
+FONT_COLOR_REGEX = re.compile(r"(?:Font Color|Thread Color)\s*[:\-]\s*([A-Za-z ]+)")
+
+def piece_line_regex(piece_name: str) -> re.Pattern:
+    return re.compile(r"\b" + re.escape(piece_name) + r"\s*:\s*(.*)")
 
 # ======================================================
-# MODELS
+# DATA STRUCTURE
 # ======================================================
 @dataclass
 class LineItem:
-    order_id: str
-    order_date: str
-    shipping_service: str
-    buyer_full_name: str
-    sku: str
-    product_type: str
-    color: str
-    quantity: int
-    font: str
-    thread_color: str
-    customization: Dict[str, str]
+    order_id: str = ""
+    order_date: str = ""
+    shipping_service: str = ""
+    buyer_name: str = ""
+    sku_full: str = ""
+    product_type: str = ""
+    color: str = ""
+    font_name: str = ""
+    thread_color: str = ""
+    quantity: int = 1
+    customization: Dict[str, str] = None
+
+    def to_row(self):
+        custom_str = ""
+        if self.customization:
+            chunks = []
+            for p, _sz in PRODUCT_TYPES.get(self.product_type, {"pieces": []})["pieces"]:
+                val = (self.customization or {}).get(p, "").strip()
+                if val:
+                    chunks.append(f"{p}: {val}")
+            custom_str = " | ".join(chunks)
+        return {
+            "Order ID": self.order_id,
+            "Buyer Name": self.buyer_name,
+            "Product Type": PRODUCT_TYPES.get(self.product_type, {}).get("label", self.product_type),
+            "Color": self.color,
+            "Quantity": self.quantity,
+            "Font": self.font_name,
+            "Thread Color": self.thread_color,
+            "Shipping Service": self.shipping_service,
+            "SKU": self.sku_full,
+            "Customization Notes": custom_str
+        }
 
 # ======================================================
-# CONSTANTS / REGEX
+# PARSING
 # ======================================================
-ORDER_ID_RE = re.compile(r"^Order ID:\s*([0-9\-]+)(?:\s*Custom Order)?", re.IGNORECASE)
-ORDER_DATE_RE = re.compile(r"^Order Date:\s*$", re.IGNORECASE)
-SHIPPING_SERVICE_RE = re.compile(r"^Shipping Service:\s*$", re.IGNORECASE)
-SHIP_TO_RE = re.compile(r"^Ship To:\s*$", re.IGNORECASE)
-SKU_RE = re.compile(r"^SKU:\s*(.+)$", re.IGNORECASE)
-CHOOSE_FONT_RE = re.compile(r"^Choose Your Font:\s*(.+)$", re.IGNORECASE)
-FONT_COLOR_RE = re.compile(r"^Font Color:\s*([A-Za-z ]+)\s*(?:\(|$)", re.IGNORECASE)
-STANDALONE_QTY_RE = re.compile(r"^\s*(\d+)\s*$")
-CUSTOMIZATIONS_HEADER_RE = re.compile(r"^Customizations:\s*$", re.IGNORECASE)
-
-# map sku prefix -> human readable type and expected pieces
-PRODUCT_MAP = {
-    "Set-6Pcs": ("6-pc Set", ["First Washcloth", "Second Washcloth",
-                               "First Hand Towel", "Second Hand Towel",
-                               "First Bath Towel", "Second Bath Towel"]),
-    "Set-3Pcs": ("3-pc Set", ["Washcloth", "Hand Towel", "Bath Towel"]),
-    "HT-2PCS": ("2-pc Hand Towels", ["First Hand Towel", "Second Hand Towel"]),
-    "HT-2Pcs": ("2-pc Hand Towels", ["First Hand Towel", "Second Hand Towel"]),  # guard mixed case
-    "BT-2Pcs": ("2-pc Bath Towels", ["First Bath Towel", "Second Bath Towel"]),
-    "BS-1Pcs": ("Bath Sheet (Oversized)", ["Oversized Bath Sheet"]),
-}
-
-SIZE_CONVERSIONS = {
-    "Washcloth": "Washcloth (Small)",
-    "Hand Towel": "Hand Towel (Medium)",
-    "Bath Towel": "Bath Towel (Large)",
-    "Bath Sheet": "Bath Sheet (Oversized)",
-}
-
-# ======================================================
-# HELPERS
-# ======================================================
-def extract_text_lines(pdf_bytes: bytes) -> List[str]:
-    """Return a flat list of lines for the whole PDF (page order kept)."""
-    lines: List[str] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            page_lines = [ln.rstrip() for ln in txt.splitlines()]
-            lines.extend(page_lines)
-    return lines
-
-def is_order_header(line: str) -> Optional[str]:
-    m = ORDER_ID_RE.match(line.strip())
-    return m.group(1) if m else None
-
-def parse_order_date(lines: List[str], start_idx: int) -> str:
-    # Look ahead for "Order Date:" then take the next non-empty line
-    for i in range(start_idx, min(start_idx + 40, len(lines))):
-        if ORDER_DATE_RE.match(lines[i].strip()):
-            # next non-empty line
-            for j in range(i+1, min(i+6, len(lines))):
-                if lines[j].strip():
-                    return lines[j].strip().rstrip(",")
-            break
-    return ""
-
-def parse_shipping_service(lines: List[str], start_idx: int) -> str:
-    for i in range(start_idx, min(start_idx + 40, len(lines))):
-        if SHIPPING_SERVICE_RE.match(lines[i].strip()):
-            for j in range(i+1, min(i+6, len(lines))):
-                if lines[j].strip():
-                    return lines[j].strip()
-            break
-    return ""
-
-def parse_buyer_full_name(lines: List[str], start_idx: int) -> str:
-    """Find the 'Ship To:' block and return the first line after it as the full name."""
-    for i in range(start_idx, min(start_idx + 80, len(lines))):
-        if SHIP_TO_RE.match(lines[i].strip()):
-            # next non-empty line should be name
-            for j in range(i+1, min(i+6, len(lines))):
-                if lines[j].strip():
-                    return lines[j].strip()
-            break
-    return ""
-
-def split_orders(lines: List[str]) -> List[Tuple[int, int]]:
-    """Return list of (start_idx, end_idx_exclusive) spans for each order using 'Order ID' headers only."""
-    headers = []
-    for i, ln in enumerate(lines):
-        if is_order_header(ln):
-            headers.append(i)
-    spans = []
-    for idx, start in enumerate(headers):
-        end = headers[idx+1] if idx+1 < len(headers) else len(lines)
-        spans.append((start, end))
-    return spans
-
-def parse_sku_color(sku_line: str) -> Tuple[str, str]:
-    # sku like "Set-6Pcs-Mid Blue" => product "Set-6Pcs", color "Mid Blue"
-    sku = sku_line.strip()
-    color = ""
-    product = sku
-    if "-" in sku:
-        parts = sku.split("-")
-        # join all but last as product (to keep Set-6Pcs etc.), last is color (may have spaces)
-        product = "-".join(parts[:2]) if sku.startswith(("Set", "HT", "BT", "BS")) else "-".join(parts[:-1])
-        color = parts[-1].replace("_", " ").replace("Grey", "Gray")  # normalize UK/US spelling if present
-        # Special case: BT-2Pcs-MidBlue vs BT-2Pcs-Mid Blue
-        if color and re.match(r"^[A-Za-z]+Blue$", color):
-            color = color.replace("Blue", " Blue")
-        if product.startswith("Set-"):
-            # product already ok; color may be multi word if more hyphens; capture from last hyphen onward
-            color = sku.split("-", 2)[-1] if sku.startswith("Set-") else color
-            # remove leading subtype like "3Pcs-" inside the remainder if any
-            if product == "Set-6Pcs" and color.startswith("6Pcs-"):
-                color = color.split("-", 1)[-1]
-            if product == "Set-3Pcs" and color.startswith("3Pcs-"):
-                color = color.split("-", 1)[-1]
-    return product, color.strip()
-
-def guess_product_type(product: str) -> Tuple[str, List[str]]:
-    for key, (display, pieces) in PRODUCT_MAP.items():
-        if product.startswith(key):
-            return display, pieces
-    # Fallback for monogram SKUs like "NAVY - B" or "BLACK - D"
-    return ("Monogram Towels", [])
-
-def find_quantity_near(lines: List[str], idx: int) -> int:
-    """Look backwards up to 10 lines for a standalone number before the SKU section."""
-    for j in range(idx-1, max(idx-11, -1), -1):
-        m = STANDALONE_QTY_RE.match(lines[j])
+def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
+    pre_text = block_text[:sku_start_index]
+    pre_lines = pre_text.splitlines()[-15:]
+    for line in reversed(pre_lines):
+        m = re.search(r'\bQuantity\b[^\d]*(\d+)\b', line, re.IGNORECASE)
         if m:
-            try:
-                return int(m.group(1))
-            except ValueError:
-                pass
+            return int(m.group(1))
+    for line in reversed(pre_lines):
+        m = re.match(r'^\s*(\d+)\s+[A-Za-z]', line)
+        if m:
+            return int(m.group(1))
     return 1
 
-def parse_customizations(lines: List[str], start_idx: int, product_display: str, expected_pieces: List[str]) -> Tuple[str, str, Dict[str, str]]:
-    """From a 'Customizations:' section, return (font, thread_color, customization dict)."""
-    font = ""
-    thread = ""
-    custom: Dict[str, str] = {}
+def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> List[LineItem]:
+    items = []
+    if not block_text.strip():
+        return items
+    sku_spans = [(m, m.start(), m.end()) for m in SKU_REGEX.finditer(block_text)]
+    if not sku_spans:
+        return items
 
-    # We scan forward from start_idx until we hit a blank line or next order/SKU block boundary
-    i = start_idx
-    while i < len(lines):
-        ln = lines[i].strip()
-        if not ln:
-            # allow sparse gaps; break if we pass 25 lines
-            if i - start_idx > 25:
-                break
-            i += 1
-            continue
+    for i, (m, s, e) in enumerate(sku_spans):
+        end = sku_spans[i + 1][1] if i + 1 < len(sku_spans) else len(block_text)
+        chunk = block_text[s:end]
+        prefix = m.group(1)
+        color = m.group(2).strip()
+        color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, 1)[0].strip()
+        color = " ".join(w.capitalize() for w in color.split())
+        sku_full = f"{prefix}-{color}"
 
-        # stops: a new 'Order ID:' or another 'SKU:' indicates next block
-        if ORDER_ID_RE.match(ln) or SKU_RE.match(ln):
-            break
-
-        m = CHOOSE_FONT_RE.match(ln)
-        if m:
-            font = m.group(1).strip()
-            i += 1
-            continue
-        m = FONT_COLOR_RE.match(ln)
-        if m:
-            thread = m.group(1).strip()
-            i += 1
-            continue
-
-        # piece lines like "First Hand Towel: Jojo"
-        if ":" in ln:
-            key, val = ln.split(":", 1)
-            key = key.strip()
-            val = val.strip()
-            # keep only expected piece labels for structured products
-            if expected_pieces:
-                # Normalize similar variants (e.g., '2Pcs Bath Towel:' pre-headers can appear; ignore them)
-                if key in expected_pieces or any(key.endswith(p.split()[0]) for p in expected_pieces):
-                    custom[key] = val
-            else:
-                # Monogram or unknown: collect useful fields
-                if key.lower() in {"first hand towel", "second hand towel",
-                                   "first bath towel", "second bath towel",
-                                   "washcloth", "hand towel", "bath towel",
-                                   "oversized bath sheet"}:
-                    custom[key] = val
-        i += 1
-
-    return font, thread, custom
-
-def parse_orders_from_text(lines: List[str]) -> List[LineItem]:
-    items: List[LineItem] = []
-    order_spans = split_orders(lines)
-    for start, end in order_spans:
-        order_id_line = lines[start]
-        order_id = is_order_header(order_id_line) or ""
-        order_date = parse_order_date(lines, start)
-        shipping_service = parse_shipping_service(lines, start)
-        buyer_full_name = parse_buyer_full_name(lines, start)
-
-        # within this span, find each SKU block
-        for i in range(start, end):
-            m = SKU_RE.match(lines[i].strip())
-            if not m:
-                continue
-            sku_raw = m.group(1).strip()
-            product_code, color = parse_sku_color(sku_raw)
-            product_display, expected_pieces = guess_product_type(product_code)
-
-            # Look backwards for quantity as standalone number
-            qty = find_quantity_near(lines, i)
-
-            # Find the nearest 'Customizations:' after this SKU line
-            font = ""
-            thread = ""
-            customization: Dict[str, str] = {}
-            # search forward up to next 40 lines
-            for j in range(i, min(i+40, end)):
-                if CUSTOMIZATIONS_HEADER_RE.match(lines[j].strip()):
-                    font, thread, customization = parse_customizations(lines, j+1, product_display, expected_pieces)
-                    break
-
-            # Concatenate empty pieces if missing to keep columns consistent later
-            items.append(LineItem(
-                order_id=order_id,
-                order_date=order_date,
-                shipping_service=shipping_service,
-                buyer_full_name=buyer_full_name,
-                sku=sku_raw,
-                product_type=product_display,
-                color=color,
-                quantity=qty,
-                font=font,
-                thread_color=thread,
-                customization=customization
-            ))
+        item = LineItem(
+            order_id=order_meta.get("order_id", ""),
+            order_date=order_meta.get("order_date", ""),
+            shipping_service=order_meta.get("shipping_service", ""),
+            buyer_name=order_meta.get("buyer_name", ""),
+            sku_full=sku_full,
+            product_type=prefix,
+            color=color,
+            quantity=_find_quantity_before_index(block_text, s),
+        )
+        fr, fcr = FONT_REGEX.search(chunk), FONT_COLOR_REGEX.search(chunk)
+        if fr: item.font_name = fr.group(1).strip()
+        if fcr: item.thread_color = fcr.group(1).strip()
+        item.customization = {}
+        for piece_name, _size in PRODUCT_TYPES.get(prefix, {}).get("pieces", []):
+            pr = piece_line_regex(piece_name).search(chunk)
+            if pr:
+                item.customization[piece_name] = pr.group(1).strip()
+        items.append(item)
     return items
 
-def rows_for_dashboard(items: List[LineItem]) -> pd.DataFrame:
-    records: List[Dict[str, Any]] = []
-    for it in items:
-        # concat customization into one line "a | b | c" in the expected order if we know it
-        cust_parts: List[str] = []
-        # derive order from product type
-        order_map = {
-            "6-pc Set": ["First Washcloth", "Second Washcloth", "First Hand Towel",
-                         "Second Hand Towel", "First Bath Towel", "Second Bath Towel"],
-            "3-pc Set": ["Washcloth", "Hand Towel", "Bath Towel"],
-            "2-pc Hand Towels": ["First Hand Towel", "Second Hand Towel"],
-            "2-pc Bath Towels": ["First Bath Towel", "Second Bath Towel"],
-            "Bath Sheet (Oversized)": ["Oversized Bath Sheet"],
-        }
-        sequence = order_map.get(it.product_type, [])
-        if sequence:
-            for k in sequence:
-                v = it.customization.get(k, "")
-                if v:
-                    cust_parts.append(v)
+def parse_pdf_files(uploaded_files) -> List[LineItem]:
+    all_items = []
+    for uf in uploaded_files:
+        with pdfplumber.open(uf) as pdf:
+            current_order, carry_text = {}, ""
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                header = "\n".join(text.splitlines()[:10])
+                header_order = ORDER_ID_REGEX.search(header)
+                ship_to = SHIP_TO_REGEX.search(header)
+                if header_order:
+                    all_items.extend(extract_items_from_block(carry_text, current_order))
+                    current_order = {
+                        "order_id": header_order.group(1).strip(),
+                        "order_date": (ORDER_DATE_REGEX.search(text) or re.match(r"$^","")).group(1).strip() if ORDER_DATE_REGEX.search(text) else "",
+                        "shipping_service": (SHIPPING_SERVICE_REGEX.search(text) or re.match(r"$^","")).group(1).strip() if SHIPPING_SERVICE_REGEX.search(text) else "",
+                        "buyer_name": ship_to.group(1).strip() if ship_to else (BUYER_NAME_REGEX.search(text).group(1).strip() if BUYER_NAME_REGEX.search(text) else "")
+                    }
+                    carry_text = text + "\n"
+                else:
+                    carry_text += text + "\n"
+            all_items.extend(extract_items_from_block(carry_text, current_order))
+    return all_items
+
+# ======================================================
+# GROUPING + LABEL BUILDER
+# ======================================================
+def group_items(items: List[LineItem]) -> List[LineItem]:
+    grouped = {}
+    for item in items:
+        key = (item.order_id, item.sku_full, item.thread_color, str(item.customization))
+        if key not in grouped:
+            grouped[key] = item
         else:
-            # unknown / monogram: join any values we have
-            for k, v in it.customization.items():
-                if v:
-                    cust_parts.append(v)
-        cust_str = " | ".join(cust_parts)
+            grouped[key].quantity += item.quantity
+    return list(grouped.values())
 
-        records.append({
-            "Order ID": it.order_id,
-            "Order Date": it.order_date,
-            "Buyer Name": it.buyer_full_name,
-            "Product Type": it.product_type,
-            "Color": it.color,
-            "Quantity": it.quantity,
-            "Font": it.font,
-            "Thread Color": it.thread_color,
-            "Customization": cust_str,
-            "Shipping Service": it.shipping_service,
-            "SKU": it.sku,
-        })
-    df = pd.DataFrame.from_records(records)
-    # ensure consistent column order
-    cols = ["Order ID","Order Date","Buyer Name","Product Type","Color","Quantity",
-            "Font","Thread Color","Customization","Shipping Service","SKU"]
-    df = df[cols]
-    return df
+def build_labels_pdf(items: List[LineItem]) -> bytes:
+    buf = io.BytesIO()
+    PAGE_W, PAGE_H = 6 * inch, 4 * inch
+    c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
 
-def draw_label(c: canvas.Canvas, data: Dict[str, Any]):
-    """Draw a single 6x4 landscape label on the given canvas at origin (0,0)."""
-    # Page size 6x4 landscape
-    width, height = (6 * inch, 4 * inch)
+    for item in items:
+        x0, y = 0.4 * inch, PAGE_H - 0.5 * inch
+        line_gap, big_gap = 14, 18
 
-    # Layout: left and right columns
-    margin = 0.3 * inch
-    gutter = 0.2 * inch
-    col_width = (width - 2*margin - gutter) / 2
+        # Header
+        c.setFont("Helvetica-Bold", 12)
+        ship = item.shipping_service or "Standard"
+        c.drawString(x0, y, f"Order ID: {item.order_id}")
+        c.drawRightString(PAGE_W - 0.4 * inch, y, f"Shipping: {ship}")
+        y -= big_gap
 
-    # Left column positions
-    x_left = margin
-    y_top = height - margin
+        # Buyer
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x0, y, f"Buyer: {item.buyer_name[:50]}")
+        y -= line_gap
 
-    def text(x, y, s, size=12, bold=False, color=colors.black):
-        c.setFillColor(color)
-        if bold:
-            c.setFont("Helvetica-Bold", size)
-        else:
-            c.setFont("Helvetica", size)
-        c.drawString(x, y, s)
+        # Product & Quantity
+        c.setFont("Helvetica", 12)
+        c.drawString(x0, y, f"Product: {PRODUCT_TYPES.get(item.product_type, {}).get('label', item.product_type)}")
+        y -= big_gap
+        c.setFont("Helvetica-BoldOblique", 16)
+        plural = PRODUCT_TYPES.get(item.product_type, {}).get("plural_word", "Qty")
+        c.drawString(x0, y, f"Quantity: {item.quantity} {plural}")
+        y -= big_gap
 
-    # LEFT
-    y = y_top
-    text(x_left, y, f"BUYER: {data.get('buyer','')}", size=12, bold=False)
-    y -= 16
-    text(x_left, y, f"PRODUCT TYPE: {data.get('product_type','')}", size=12, bold=False)
-    y -= 16
-    text(x_left, y, f"COLOR: {data.get('color','')}", size=16, bold=True)
-    y -= 20
-    text(x_left, y, f"THREAD/FONT COLOR: {data.get('thread','')}", size=16, bold=True)
-    y -= 20
-    text(x_left, y, f"FONT: {data.get('font','')}", size=12, bold=False)
-    y -= 16
-    qty = data.get("quantity", 1)
-    text(x_left, y, f"QUANTITY: {qty} Set(s)", size=14, bold=True)
+        # Colors
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(x0, y, f"Towel Color: {item.color.upper()}")
+        y -= big_gap
+        es = THREAD_COLOR_ES.get(item.thread_color.title(), "")
+        c.drawString(x0, y, f"Thread Color: {item.thread_color.upper()}  |  {es.upper() if es else ''}")
+        y -= big_gap
 
-    # RIGHT
-    x_right = margin + col_width + gutter
-    y = y_top
-    text(x_right, y, "CUSTOMIZATION:", size=9, bold=True, color=colors.gray)
-    y -= 14
+        # Divider
+        c.setStrokeColor(colors.lightgrey)
+        c.setLineWidth(1)
+        c.line(x0, y, PAGE_W - 0.4 * inch, y)
+        y -= big_gap
 
-    # Each line of customization, apply size conversions on label only
-    for label, value in data.get("custom_lines", []):
-        # label may contain "Washcloth", "Hand Towel", etc.
-        conv_label = label
-        if "Washcloth" in label:
-            conv_label = SIZE_CONVERSIONS["Washcloth"]
-        elif "Hand Towel" in label:
-            conv_label = SIZE_CONVERSIONS["Hand Towel"]
-        elif "Bath Towel" in label:
-            conv_label = SIZE_CONVERSIONS["Bath Towel"]
-        elif "Bath Sheet" in label:
-            conv_label = SIZE_CONVERSIONS["Bath Sheet"]
-        text(x_right, y, f"{conv_label}: {value}", size=13, bold=False)
-        y -= 16
+        # Customization
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x0, y, "CUSTOMIZATION:")
+        y -= big_gap + 4  # extra space below title
 
-def make_labels_pdf(rows: pd.DataFrame) -> bytes:
-    """Return bytes of a merged PDF with one 6x4 label per row."""
-    buffer = io.BytesIO()
-    # Use exact 6x4 inches landscape
-    pagesize = (6 * inch, 4 * inch)
-    c = canvas.Canvas(buffer, pagesize=pagesize)
-    for _, r in rows.iterrows():
-        custom_lines: List[Tuple[str, str]] = []
-        # Reconstruct lines by product type to preserve order on label
-        pt = r["Product Type"]
-        # map to expected sequence
-        order_map = {
-            "6-pc Set": ["First Washcloth", "Second Washcloth", "First Hand Towel",
-                         "Second Hand Towel", "First Bath Towel", "Second Bath Towel"],
-            "3-pc Set": ["Washcloth", "Hand Towel", "Bath Towel"],
-            "2-pc Hand Towels": ["First Hand Towel", "Second Hand Towel"],
-            "2-pc Bath Towels": ["First Bath Towel", "Second Bath Towel"],
-            "Bath Sheet (Oversized)": ["Oversized Bath Sheet"],
-        }
-        sequence = order_map.get(pt, [])
-        # We don't store per-piece values in df (only concatenated string). Try to recover from SKU-based hints if needed.
-        # Prefer to split concatenated "Customization" back (best-effort).
-        values = [v.strip() for v in str(r["Customization"]).split("|")] if r["Customization"] else []
-        for i, piece in enumerate(sequence):
-            val = values[i] if i < len(values) else ""
+        c.setFont("Times-Italic", 14)
+        for piece_name, size in PRODUCT_TYPES.get(item.product_type, {}).get("pieces", []):
+            val = (item.customization or {}).get(piece_name, "")
             if val:
-                custom_lines.append((piece, val))
+                c.drawString(x0, y, f"{piece_name} ({size}): {val}")
+                y -= 16  # generous gap for readability
 
-        payload = {
-            "buyer": r["Buyer Name"],
-            "product_type": r["Product Type"],
-            "color": r["Color"],
-            "thread": r["Thread Color"],
-            "font": r["Font"],
-            "quantity": r["Quantity"],
-            "custom_lines": custom_lines,
-        }
-        draw_label(c, payload)
         c.showPage()
+
     c.save()
-    return buffer.getvalue()
-
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Orders")
-        # basic formatting
-        wb = writer.book
-        ws = writer.sheets["Orders"]
-        for idx, col in enumerate(df.columns, 1):
-            width = max(12, min(40, int(df[col].astype(str).map(len).max() or 12) + 2))
-            ws.set_column(idx-1, idx-1, width)
-    return out.getvalue()
+    return buf.getvalue()
 
 # ======================================================
-# UI
+# STREAMLIT UI
 # ======================================================
-st.title("Amazon Towel Orders — Parser & 6×4 Labels")
+st.title("🧵 Amazon Towel Orders — 4×6 Landscape Labels")
+files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
+tabs = st.tabs(["📄 Table View", "🏷️ Labels", "📊 End of Day Summary"])
 
-st.markdown(
-    "Upload Amazon packing slip PDF(s). The app parses **Order ID, Date, Ship To (full name), Shipping Service,** "
-    "and each item's **SKU, Quantity, Font, Thread Color, Customizations**. "
-    "Multi-item orders are split into separate rows/labels."
-)
+# ---- TAB 1 ----
+with tabs[0]:
+    if files:
+        items = parse_pdf_files(files)
+        if not items:
+            st.warning("No towel line items detected.")
+        else:
+            df = pd.DataFrame([i.to_row() for i in items])
+            st.dataframe(df, use_container_width=True)
+            st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode("utf-8"), "towel_orders.csv")
+    else:
+        st.info("Upload PDFs to see parsed results.")
 
-uploaded_files = st.file_uploader("Upload PDF(s) from Amazon Seller Central", type=["pdf"], accept_multiple_files=True)
+# ---- TAB 2 ----
+with tabs[1]:
+    if files:
+        items = group_items(parse_pdf_files(files))
+        if items:
+            df = pd.DataFrame([i.to_row() for i in items])
+            all_ids = [f"{r['Order ID']} | {r['SKU']}" for _, r in df.iterrows()]
+            selected = st.multiselect("Select items:", all_ids, default=all_ids)
+            key_map = {f"{i.order_id} | {i.sku_full}": i for i in items}
+            selected_items = [key_map[k] for k in selected if k in key_map]
+            if st.button("🖨️ Build 4×6 Labels PDF"):
+                pdf_bytes = build_labels_pdf(selected_items)
+                st.download_button("⬇️ Download 4×6 Labels (PDF)", pdf_bytes, "towel_labels_grouped.pdf")
+        else:
+            st.warning("Nothing parsed yet.")
+    else:
+        st.info("Upload PDFs to generate labels.")
 
-if uploaded_files:
-    with st.spinner("Parsing PDFs…"):
-        all_items: List[LineItem] = []
-        for uf in uploaded_files:
-            pdf_bytes = uf.read()
-            lines = extract_text_lines(pdf_bytes)
-            all_items.extend(parse_orders_from_text(lines))
-
-    if not all_items:
-        st.warning("No orders detected. Make sure these are Amazon packing slips.")
-        st.stop()
-
-    df = rows_for_dashboard(all_items)
-
-    # Filters
-    col1, col2 = st.columns(2)
-    with col1:
-        product_choices = ["(All)"] + sorted([p for p in df["Product Type"].dropna().unique()])
-        sel_product = st.selectbox("Filter by Product Type", product_choices, index=0)
-    with col2:
-        color_choices = ["(All)"] + sorted([c for c in df["Color"].dropna().unique()])
-        sel_color = st.selectbox("Filter by Color", color_choices, index=0)
-
-    df_view = df.copy()
-    if sel_product != "(All)":
-        df_view = df_view[df_view["Product Type"] == sel_product]
-    if sel_color != "(All)":
-        df_view = df_view[df_view["Color"] == sel_color]
-
-    st.subheader("Operations Dashboard")
-    st.dataframe(df_view, use_container_width=True, height=420)
-
-    # Downloads
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        csv_bytes = df_view.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download CSV", csv_bytes, file_name="towel_orders.csv", mime="text/csv")
-    with c2:
-        xls_bytes = to_excel_bytes(df_view)
-        st.download_button("⬇️ Download Excel", xls_bytes, file_name="towel_orders.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with c3:
-        labels_pdf = make_labels_pdf(df_view)
-        st.download_button("🖨️ Download ALL Labels (6x4 PDF)", labels_pdf, file_name="labels_6x4_all.pdf",
-                           mime="application/pdf")
-
-    # Per-row label generation
-    st.markdown("---")
-    st.subheader("Generate Individual Labels")
-    if len(df_view) > 0:
-        options = df_view["Order ID"] + " — " + df_view["Buyer Name"] + " — " + df_view["SKU"]
-        selected = st.selectbox("Pick an item", options.tolist())
-        if selected:
-            idx = options[options == selected].index[0]
-            one_row_pdf = make_labels_pdf(df_view.iloc[[idx]])
-            st.download_button("🖨️ Download Selected Label (6x4 PDF)", one_row_pdf,
-                               file_name="label_6x4_selected.pdf", mime="application/pdf")
-else:
-    st.info("➡️ Use the uploader above to select your packing slip PDF(s).")
+# ---- TAB 3 ----
+with tabs[2]:
+    if files:
+        items = group_items(parse_pdf_files(files))
+        if items:
+            df = pd.DataFrame([i.to_row() for i in items])
+            st.subheader("📅 End of the Day Summary")
+            st.markdown(f"**Total Orders:** {df['Order ID'].nunique()}  \n**Total Quantity:** {df['Quantity'].sum()}")
+            st.markdown("### 🧺 By Product Type")
+            st.dataframe(df.groupby("Product Type")["Quantity"].sum().reset_index().rename(columns={"Quantity": "Total"}))
+            st.markdown("### 🎨 By Towel Color")
+            st.dataframe(df.groupby("Color")["Quantity"].sum().reset_index().rename(columns={"Quantity": "Total"}))
+            st.markdown("### 🧵 By Thread Color (English | Spanish)")
+            df["Thread Color (ES)"] = df["Thread Color"].apply(lambda c: THREAD_COLOR_ES.get(str(c).title(), ""))
+            st.dataframe(df.groupby(["Thread Color", "Thread Color (ES)"])["Quantity"].sum().reset_index().rename(columns={"Quantity": "Total"}))
+        else:
+            st.info("Upload PDFs to generate summary.")
+    else:
+        st.info("Upload PDFs to generate summary.")
