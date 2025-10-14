@@ -111,7 +111,7 @@ class LineItem:
         }
 
 # ======================================================
-# PARSING
+# PARSING HELPERS
 # ======================================================
 def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
     pre_text = block_text[:sku_start_index]
@@ -164,28 +164,44 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
         items.append(item)
     return items
 
+# ======================================================
+# FIXED PARSER (NO DUPLICATES)
+# ======================================================
 def parse_pdf_files(uploaded_files) -> List[LineItem]:
     all_items = []
     for uf in uploaded_files:
         with pdfplumber.open(uf) as pdf:
-            current_order, carry_text = {}, ""
+            current_order = {}
+            carry_text = ""
             for page in pdf.pages:
                 text = page.extract_text() or ""
                 header = "\n".join(text.splitlines()[:10])
                 header_order = ORDER_ID_REGEX.search(header)
                 ship_to = SHIP_TO_REGEX.search(header)
+
                 if header_order:
-                    all_items.extend(extract_items_from_block(carry_text, current_order))
+                    # Extract previous buffered order before starting new one
+                    if carry_text.strip():
+                        all_items.extend(extract_items_from_block(carry_text, current_order))
+                        carry_text = ""
+
                     current_order = {
                         "order_id": header_order.group(1).strip(),
-                        "order_date": (ORDER_DATE_REGEX.search(text) or re.match(r"$^","")).group(1).strip() if ORDER_DATE_REGEX.search(text) else "",
-                        "shipping_service": (SHIPPING_SERVICE_REGEX.search(text) or re.match(r"$^","")).group(1).strip() if SHIPPING_SERVICE_REGEX.search(text) else "",
-                        "buyer_name": ship_to.group(1).strip() if ship_to else (BUYER_NAME_REGEX.search(text).group(1).strip() if BUYER_NAME_REGEX.search(text) else "")
+                        "order_date": (ORDER_DATE_REGEX.search(text) or re.match(r"$^","")).group(1).strip()
+                        if ORDER_DATE_REGEX.search(text) else "",
+                        "shipping_service": (SHIPPING_SERVICE_REGEX.search(text) or re.match(r"$^","")).group(1).strip()
+                        if SHIPPING_SERVICE_REGEX.search(text) else "",
+                        "buyer_name": ship_to.group(1).strip()
+                        if ship_to else (BUYER_NAME_REGEX.search(text).group(1).strip()
+                        if BUYER_NAME_REGEX.search(text) else "")
                     }
-                    carry_text = text + "\n"
+                    carry_text = text
                 else:
-                    carry_text += text + "\n"
-            all_items.extend(extract_items_from_block(carry_text, current_order))
+                    carry_text += "\n" + text
+
+            # Process last order block
+            if carry_text.strip():
+                all_items.extend(extract_items_from_block(carry_text, current_order))
     return all_items
 
 # ======================================================
@@ -248,14 +264,14 @@ def build_labels_pdf(items: List[LineItem]) -> bytes:
         # Customization
         c.setFont("Helvetica-Bold", 12)
         c.drawString(x0, y, "CUSTOMIZATION:")
-        y -= big_gap + 4  # extra space below title
+        y -= big_gap + 4
 
         c.setFont("Times-Italic", 14)
         for piece_name, size in PRODUCT_TYPES.get(item.product_type, {}).get("pieces", []):
             val = (item.customization or {}).get(piece_name, "")
             if val:
                 c.drawString(x0, y, f"{piece_name} ({size}): {val}")
-                y -= 16  # generous gap for readability
+                y -= 16
 
         c.showPage()
 
