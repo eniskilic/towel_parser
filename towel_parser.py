@@ -126,10 +126,14 @@ def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
             return int(m.group(1))
     return 1
 
+# ======================================================
+# FIXED EXTRACTOR (MULTI-ITEM SAFE)
+# ======================================================
 def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> List[LineItem]:
     items = []
     if not block_text.strip():
         return items
+
     sku_spans = [(m, m.start(), m.end()) for m in SKU_REGEX.finditer(block_text)]
     if not sku_spans:
         return items
@@ -137,31 +141,43 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
     for i, (m, s, e) in enumerate(sku_spans):
         end = sku_spans[i + 1][1] if i + 1 < len(sku_spans) else len(block_text)
         chunk = block_text[s:end]
-        prefix = m.group(1)
-        color = m.group(2).strip()
-        color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, 1)[0].strip()
-        color = " ".join(w.capitalize() for w in color.split())
-        sku_full = f"{prefix}-{color}"
 
-        item = LineItem(
-            order_id=order_meta.get("order_id", ""),
-            order_date=order_meta.get("order_date", ""),
-            shipping_service=order_meta.get("shipping_service", ""),
-            buyer_name=order_meta.get("buyer_name", ""),
-            sku_full=sku_full,
-            product_type=prefix,
-            color=color,
-            quantity=_find_quantity_before_index(block_text, s),
-        )
-        fr, fcr = FONT_REGEX.search(chunk), FONT_COLOR_REGEX.search(chunk)
-        if fr: item.font_name = fr.group(1).strip()
-        if fcr: item.thread_color = fcr.group(1).strip()
-        item.customization = {}
-        for piece_name, _size in PRODUCT_TYPES.get(prefix, {}).get("pieces", []):
-            pr = piece_line_regex(piece_name).search(chunk)
-            if pr:
-                item.customization[piece_name] = pr.group(1).strip()
-        items.append(item)
+        # Split each “Customizations:” section separately (handles same SKU twice)
+        sub_chunks = re.split(r"(?=Customizations?:)", chunk)
+        for sub_chunk in sub_chunks:
+            if not SKU_REGEX.search(sub_chunk):
+                continue
+
+            prefix = m.group(1)
+            color = m.group(2).strip()
+            color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, 1)[0].strip()
+            color = " ".join(w.capitalize() for w in color.split())
+            sku_full = f"{prefix}-{color}"
+
+            item = LineItem(
+                order_id=order_meta.get("order_id", ""),
+                order_date=order_meta.get("order_date", ""),
+                shipping_service=order_meta.get("shipping_service", ""),
+                buyer_name=order_meta.get("buyer_name", ""),
+                sku_full=sku_full,
+                product_type=prefix,
+                color=color,
+                quantity=_find_quantity_before_index(block_text, s),
+            )
+
+            fr, fcr = FONT_REGEX.search(sub_chunk), FONT_COLOR_REGEX.search(sub_chunk)
+            if fr: item.font_name = fr.group(1).strip()
+            if fcr: item.thread_color = fcr.group(1).strip()
+
+            item.customization = {}
+            for piece_name, _size in PRODUCT_TYPES.get(prefix, {}).get("pieces", []):
+                pr = piece_line_regex(piece_name).search(sub_chunk)
+                if pr:
+                    item.customization[piece_name] = pr.group(1).strip()
+
+            if item.customization or item.font_name:
+                items.append(item)
+
     return items
 
 # ======================================================
@@ -180,7 +196,6 @@ def parse_pdf_files(uploaded_files) -> List[LineItem]:
                 ship_to = SHIP_TO_REGEX.search(header)
 
                 if header_order:
-                    # Extract previous buffered order before starting new one
                     if carry_text.strip():
                         all_items.extend(extract_items_from_block(carry_text, current_order))
                         carry_text = ""
@@ -199,7 +214,6 @@ def parse_pdf_files(uploaded_files) -> List[LineItem]:
                 else:
                     carry_text += "\n" + text
 
-            # Process last order block
             if carry_text.strip():
                 all_items.extend(extract_items_from_block(carry_text, current_order))
     return all_items
@@ -210,7 +224,7 @@ def parse_pdf_files(uploaded_files) -> List[LineItem]:
 def group_items(items: List[LineItem]) -> List[LineItem]:
     grouped = {}
     for item in items:
-        key = (item.order_id, item.sku_full, item.thread_color, str(item.customization))
+        key = (item.order_id, item.sku_full, item.font_name, item.thread_color, str(item.customization))
         if key not in grouped:
             grouped[key] = item
         else:
@@ -304,9 +318,9 @@ with tabs[1]:
         items = group_items(parse_pdf_files(files))
         if items:
             df = pd.DataFrame([i.to_row() for i in items])
-            all_ids = [f"{r['Order ID']} | {r['SKU']}" for _, r in df.iterrows()]
+            all_ids = [f"{r['Order ID']} | {r['SKU']} | {r['Font']}" for _, r in df.iterrows()]
             selected = st.multiselect("Select items:", all_ids, default=all_ids)
-            key_map = {f"{i.order_id} | {i.sku_full}": i for i in items}
+            key_map = {f"{i.order_id} | {i.sku_full} | {i.font_name}": i for i in items}
             selected_items = [key_map[k] for k in selected if k in key_map]
             if st.button("🖨️ Build 4×6 Labels PDF"):
                 pdf_bytes = build_labels_pdf(selected_items)
