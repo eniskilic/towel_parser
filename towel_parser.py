@@ -307,6 +307,8 @@ with tabs[0]:
             st.warning("No towel line items detected.")
         else:
             df = pd.DataFrame([i.to_row() for i in items])
+            df.index = df.index + 1  # start from 1 instead of 0
+            df.index.name = "No."
             st.dataframe(df, use_container_width=True)
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode("utf-8"), "towel_orders.csv")
     else:
@@ -318,10 +320,20 @@ with tabs[1]:
         items = group_items(parse_pdf_files(files))
         if items:
             df = pd.DataFrame([i.to_row() for i in items])
-            all_ids = [f"{r['Order ID']} | {r['SKU']} | {r['Font']}" for _, r in df.iterrows()]
-            selected = st.multiselect("Select items:", all_ids, default=all_ids)
-            key_map = {f"{i.order_id} | {i.sku_full} | {i.font_name}": i for i in items}
+
+            all_ids = [
+                f"{idx+1}. {r['Order ID']} | {r['SKU']} | {r['Font']} | {r['Thread Color']}"
+                for idx, r in df.iterrows()
+            ]
+
+            key_map = {
+                f"{idx+1}. {i.order_id} | {i.sku_full} | {i.font_name} | {i.thread_color}": i
+                for idx, i in enumerate(items)
+            }
+
+            selected = st.multiselect("Select items to include:", all_ids, default=all_ids)
             selected_items = [key_map[k] for k in selected if k in key_map]
+
             if st.button("🖨️ Build 4×6 Labels PDF"):
                 pdf_bytes = build_labels_pdf(selected_items)
                 st.download_button("⬇️ Download 4×6 Labels (PDF)", pdf_bytes, "towel_labels_grouped.pdf")
