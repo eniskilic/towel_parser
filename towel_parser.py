@@ -1,5 +1,6 @@
 import io
 import re
+import copy
 from dataclasses import dataclass
 from typing import List, Dict
 import streamlit as st
@@ -13,6 +14,7 @@ from reportlab.lib import colors
 # CONFIG
 # ======================================================
 st.set_page_config(page_title="Amazon Towel Orders — Landscape Labels", layout="wide")
+st.caption("🧠 Running towel_parser v1.9 (multi-item label sync + fixed table index)")
 
 # English → Spanish thread-color dictionary
 THREAD_COLOR_ES = {
@@ -111,7 +113,7 @@ class LineItem:
         }
 
 # ======================================================
-# PARSING HELPERS
+# HELPERS
 # ======================================================
 def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
     pre_text = block_text[:sku_start_index]
@@ -134,23 +136,23 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
     if not block_text.strip():
         return items
 
-    sku_spans = [(m, m.start(), m.end()) for m in SKU_REGEX.finditer(block_text)]
+    sku_spans = [(m.start(), m.end()) for m in SKU_REGEX.finditer(block_text)]
     if not sku_spans:
         return items
 
-    for i, (m, s, e) in enumerate(sku_spans):
-        end = sku_spans[i + 1][1] if i + 1 < len(sku_spans) else len(block_text)
+    for i, (s, e) in enumerate(sku_spans):
+        end = sku_spans[i + 1][0] if i + 1 < len(sku_spans) else len(block_text)
         chunk = block_text[s:end]
 
-        # Split by multiple customization markers
-        sub_chunks = re.split(r"(?=(?:Customizations?:|Font\s*:|Thread Color\s*:))", chunk)
-        for sub_chunk in sub_chunks:
-            if not SKU_REGEX.search(sub_chunk):
+        # Every sub_chunk can have its own "Customizations:" block
+        for sub_chunk in re.split(r"(?=Customizations?:)", chunk):
+            sku_match = SKU_REGEX.search(sub_chunk)
+            if not sku_match:
                 continue
 
-            prefix = m.group(1)
-            color = m.group(2).strip()
-            color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, 1)[0].strip()
+            prefix = sku_match.group(1)
+            color = sku_match.group(2).strip()
+            color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, maxsplit=1)[0].strip()
             color = " ".join(w.capitalize() for w in color.split())
             sku_full = f"{prefix}-{color}"
 
@@ -163,20 +165,23 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
                 product_type=prefix,
                 color=color,
                 quantity=_find_quantity_before_index(block_text, s),
+                customization={}
             )
 
             fr, fcr = FONT_REGEX.search(sub_chunk), FONT_COLOR_REGEX.search(sub_chunk)
-            if fr: item.font_name = fr.group(1).strip()
-            if fcr: item.thread_color = fcr.group(1).strip()
+            if fr:
+                item.font_name = fr.group(1).strip()
+            if fcr:
+                item.thread_color = fcr.group(1).strip()
 
-            item.customization = {}
             for piece_name, _size in PRODUCT_TYPES.get(prefix, {}).get("pieces", []):
                 pr = piece_line_regex(piece_name).search(sub_chunk)
                 if pr:
                     item.customization[piece_name] = pr.group(1).strip()
 
             if item.customization or item.font_name:
-                items.append(item)
+                items.append(copy.deepcopy(item))
+
     return items
 
 # ======================================================
@@ -223,9 +228,10 @@ def parse_pdf_files(uploaded_files) -> List[LineItem]:
 def group_items(items: List[LineItem]) -> List[LineItem]:
     grouped = {}
     for item in items:
-        key = (item.order_id, item.sku_full, item.font_name, item.thread_color, str(item.customization))
+        custom_str = "|".join(f"{k}:{v}" for k, v in sorted((item.customization or {}).items()))
+        key = (item.order_id, item.sku_full, item.font_name, item.thread_color, custom_str)
         if key not in grouped:
-            grouped[key] = item
+            grouped[key] = copy.deepcopy(item)
         else:
             grouped[key].quantity += item.quantity
     return list(grouped.values())
@@ -319,7 +325,7 @@ with tabs[0]:
             df = pd.DataFrame([i.to_row() for i in items])
             df.index = df.index + 1
             df.index.name = "No."
-            st.dataframe(df, use_container_width=True)
+            st.table(df)  # preserves numbering
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode("utf-8"), "towel_orders.csv")
     else:
         st.info("Upload PDFs to see parsed results.")
