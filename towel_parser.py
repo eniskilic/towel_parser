@@ -13,6 +13,7 @@ from reportlab.lib import colors
 # CONFIG
 # ======================================================
 st.set_page_config(page_title="Amazon Towel Orders — Landscape Labels", layout="wide")
+st.caption("🧠 towel_parser v2.0 — Flexible SKU detection + Diagnostics")
 
 # English → Spanish thread-color dictionary
 THREAD_COLOR_ES = {
@@ -58,8 +59,17 @@ PRODUCT_TYPES = {
     },
 }
 
+# ======================================================
+# REGEX DEFINITIONS
+# ======================================================
 SKU_PREFIXES = list(PRODUCT_TYPES.keys())
-SKU_REGEX = re.compile(r"\b(" + "|".join([re.escape(p) for p in SKU_PREFIXES]) + r")-([A-Za-z ]+)\b")
+
+# ✅ More flexible SKU regex (handles spaces, dashes, mixed case)
+SKU_REGEX = re.compile(
+    r"\b(" + "|".join([re.escape(p) for p in SKU_PREFIXES]) + r")[\s\-:]*([A-Za-z()&/ ]+)\b",
+    re.IGNORECASE
+)
+
 ORDER_ID_REGEX = re.compile(r"\bOrder ID\b[: ]+([A0-9\-]+)", re.IGNORECASE)
 ORDER_DATE_REGEX = re.compile(r"\bOrder Date\b[: ]+([A-Za-z0-9, ]+)")
 SHIPPING_SERVICE_REGEX = re.compile(r"\bShipping Service\b[: ]+([A-Za-z ]+)")
@@ -72,7 +82,7 @@ def piece_line_regex(piece_name: str) -> re.Pattern:
     return re.compile(r"\b" + re.escape(piece_name) + r"\s*:\s*(.*)")
 
 # ======================================================
-# DATA STRUCTURE
+# DATA CLASS
 # ======================================================
 @dataclass
 class LineItem:
@@ -111,7 +121,7 @@ class LineItem:
         }
 
 # ======================================================
-# PARSING HELPERS
+# HELPERS
 # ======================================================
 def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
     pre_text = block_text[:sku_start_index]
@@ -127,30 +137,29 @@ def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
     return 1
 
 # ======================================================
-# FIXED EXTRACTOR (MULTI-ITEM SAFE)
+# EXTRACTOR
 # ======================================================
 def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> List[LineItem]:
     items = []
     if not block_text.strip():
         return items
 
-    sku_spans = [(m, m.start(), m.end()) for m in SKU_REGEX.finditer(block_text)]
+    sku_spans = [(m.start(), m.end()) for m in SKU_REGEX.finditer(block_text)]
     if not sku_spans:
         return items
 
-    for i, (m, s, e) in enumerate(sku_spans):
-        end = sku_spans[i + 1][1] if i + 1 < len(sku_spans) else len(block_text)
+    for i, (s, e) in enumerate(sku_spans):
+        end = sku_spans[i + 1][0] if i + 1 < len(sku_spans) else len(block_text)
         chunk = block_text[s:end]
 
-        # Split each “Customizations:” section separately (handles same SKU twice)
-        sub_chunks = re.split(r"(?=Customizations?:)", chunk)
-        for sub_chunk in sub_chunks:
-            if not SKU_REGEX.search(sub_chunk):
+        for sub_chunk in re.split(r"(?=Customizations?:)", chunk):
+            sku_match = SKU_REGEX.search(sub_chunk)
+            if not sku_match:
                 continue
 
-            prefix = m.group(1)
-            color = m.group(2).strip()
-            color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, 1)[0].strip()
+            prefix = sku_match.group(1)
+            color = sku_match.group(2).strip()
+            color = re.split(r"\b(Item|Tax|Promotion|Total|Subtotal|Shipping)\b", color, maxsplit=1)[0].strip()
             color = " ".join(w.capitalize() for w in color.split())
             sku_full = f"{prefix}-{color}"
 
@@ -163,13 +172,15 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
                 product_type=prefix,
                 color=color,
                 quantity=_find_quantity_before_index(block_text, s),
+                customization={}
             )
 
             fr, fcr = FONT_REGEX.search(sub_chunk), FONT_COLOR_REGEX.search(sub_chunk)
-            if fr: item.font_name = fr.group(1).strip()
-            if fcr: item.thread_color = fcr.group(1).strip()
+            if fr:
+                item.font_name = fr.group(1).strip()
+            if fcr:
+                item.thread_color = fcr.group(1).strip()
 
-            item.customization = {}
             for piece_name, _size in PRODUCT_TYPES.get(prefix, {}).get("pieces", []):
                 pr = piece_line_regex(piece_name).search(sub_chunk)
                 if pr:
@@ -181,7 +192,7 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
     return items
 
 # ======================================================
-# FIXED PARSER (NO DUPLICATES)
+# PARSER WITH DIAGNOSTICS
 # ======================================================
 def parse_pdf_files(uploaded_files) -> List[LineItem]:
     all_items = []
@@ -189,15 +200,22 @@ def parse_pdf_files(uploaded_files) -> List[LineItem]:
         with pdfplumber.open(uf) as pdf:
             current_order = {}
             carry_text = ""
-            for page in pdf.pages:
+
+            for page_num, page in enumerate(pdf.pages, start=1):
                 text = page.extract_text() or ""
+                if page_num == 1:
+                    st.info(f"📄 Parsing {uf.name} — Page {page_num}")
+                    st.text_area("Raw PDF Text Preview (first 1200 chars)", text[:1200], height=250)
+
                 header = "\n".join(text.splitlines()[:10])
                 header_order = ORDER_ID_REGEX.search(header)
                 ship_to = SHIP_TO_REGEX.search(header)
 
                 if header_order:
                     if carry_text.strip():
-                        all_items.extend(extract_items_from_block(carry_text, current_order))
+                        extracted = extract_items_from_block(carry_text, current_order)
+                        all_items.extend(extracted)
+                        st.write(f"✅ Extracted {len(extracted)} items from previous block.")
                         carry_text = ""
 
                     current_order = {
@@ -215,11 +233,15 @@ def parse_pdf_files(uploaded_files) -> List[LineItem]:
                     carry_text += "\n" + text
 
             if carry_text.strip():
-                all_items.extend(extract_items_from_block(carry_text, current_order))
+                extracted = extract_items_from_block(carry_text, current_order)
+                all_items.extend(extracted)
+                st.write(f"✅ Extracted {len(extracted)} items from final block.")
+
+    st.success(f"🎯 Total parsed items: {len(all_items)}")
     return all_items
 
 # ======================================================
-# GROUPING + LABEL BUILDER
+# GROUPING + LABELS
 # ======================================================
 def group_items(items: List[LineItem]) -> List[LineItem]:
     grouped = {}
@@ -240,19 +262,16 @@ def build_labels_pdf(items: List[LineItem]) -> bytes:
         x0, y = 0.4 * inch, PAGE_H - 0.5 * inch
         line_gap, big_gap = 14, 18
 
-        # Header
         c.setFont("Helvetica-Bold", 12)
         ship = item.shipping_service or "Standard"
         c.drawString(x0, y, f"Order ID: {item.order_id}")
         c.drawRightString(PAGE_W - 0.4 * inch, y, f"Shipping: {ship}")
         y -= big_gap
 
-        # Buyer
         c.setFont("Helvetica-Bold", 12)
         c.drawString(x0, y, f"Buyer: {item.buyer_name[:50]}")
         y -= line_gap
 
-        # Product & Quantity
         c.setFont("Helvetica", 12)
         c.drawString(x0, y, f"Product: {PRODUCT_TYPES.get(item.product_type, {}).get('label', item.product_type)}")
         y -= big_gap
@@ -261,21 +280,17 @@ def build_labels_pdf(items: List[LineItem]) -> bytes:
         c.drawString(x0, y, f"Quantity: {item.quantity} {plural}")
         y -= big_gap
 
-        # Colors
         c.setFont("Helvetica-Bold", 16)
         c.drawString(x0, y, f"Towel Color: {item.color.upper()}")
         y -= big_gap
         es = THREAD_COLOR_ES.get(item.thread_color.title(), "")
-        c.drawString(x0, y, f"Thread Color: {item.thread_color.upper()}  |  {es.upper() if es else ''}")
+        c.drawString(x0, y, f"Thread Color: {item.thread_color.upper()} | {es.upper() if es else ''}")
         y -= big_gap
 
-        # Divider
         c.setStrokeColor(colors.lightgrey)
-        c.setLineWidth(1)
         c.line(x0, y, PAGE_W - 0.4 * inch, y)
         y -= big_gap
 
-        # Customization
         c.setFont("Helvetica-Bold", 12)
         c.drawString(x0, y, "CUSTOMIZATION:")
         y -= big_gap + 4
@@ -307,7 +322,9 @@ with tabs[0]:
             st.warning("No towel line items detected.")
         else:
             df = pd.DataFrame([i.to_row() for i in items])
-            st.dataframe(df, use_container_width=True)
+            df.index = df.index + 1
+            df.index.name = "No."
+            st.table(df)
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode("utf-8"), "towel_orders.csv")
     else:
         st.info("Upload PDFs to see parsed results.")
@@ -318,9 +335,9 @@ with tabs[1]:
         items = group_items(parse_pdf_files(files))
         if items:
             df = pd.DataFrame([i.to_row() for i in items])
-            all_ids = [f"{r['Order ID']} | {r['SKU']} | {r['Font']}" for _, r in df.iterrows()]
-            selected = st.multiselect("Select items:", all_ids, default=all_ids)
-            key_map = {f"{i.order_id} | {i.sku_full} | {i.font_name}": i for i in items}
+            all_ids = [f"{idx+1}. {r['Order ID']} | {r['SKU']} | {r['Font']} | {r['Thread Color']}" for idx, r in df.iterrows()]
+            key_map = {f"{idx+1}. {i.order_id} | {i.sku_full} | {i.font_name} | {i.thread_color}": i for idx, i in enumerate(items)}
+            selected = st.multiselect("Select items to include:", all_ids, default=all_ids)
             selected_items = [key_map[k] for k in selected if k in key_map]
             if st.button("🖨️ Build 4×6 Labels PDF"):
                 pdf_bytes = build_labels_pdf(selected_items)
