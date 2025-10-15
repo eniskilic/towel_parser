@@ -127,7 +127,7 @@ def _find_quantity_before_index(block_text: str, sku_start_index: int) -> int:
     return 1
 
 # ======================================================
-# FIXED EXTRACTOR (MULTI-ITEM SAFE)
+# MULTI-ITEM SAFE EXTRACTOR
 # ======================================================
 def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> List[LineItem]:
     items = []
@@ -142,8 +142,8 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
         end = sku_spans[i + 1][1] if i + 1 < len(sku_spans) else len(block_text)
         chunk = block_text[s:end]
 
-        # Split each “Customizations:” section separately (handles same SKU twice)
-        sub_chunks = re.split(r"(?=Customizations?:)", chunk)
+        # Split by multiple customization markers
+        sub_chunks = re.split(r"(?=(?:Customizations?:|Font\s*:|Thread Color\s*:))", chunk)
         for sub_chunk in sub_chunks:
             if not SKU_REGEX.search(sub_chunk):
                 continue
@@ -177,11 +177,10 @@ def extract_items_from_block(block_text: str, order_meta: Dict[str, str]) -> Lis
 
             if item.customization or item.font_name:
                 items.append(item)
-
     return items
 
 # ======================================================
-# FIXED PARSER (NO DUPLICATES)
+# PARSER
 # ======================================================
 def parse_pdf_files(uploaded_files) -> List[LineItem]:
     all_items = []
@@ -297,17 +296,28 @@ def build_labels_pdf(items: List[LineItem]) -> bytes:
 # ======================================================
 st.title("🧵 Amazon Towel Orders — 4×6 Landscape Labels")
 files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
+
+# Sidebar re-parse button
+if st.sidebar.button("🔄 Re-parse Files"):
+    if files:
+        st.session_state.parsed_items = parse_pdf_files(files)
+        st.sidebar.success("Re-parsed successfully!")
+    else:
+        st.sidebar.warning("Please upload PDFs first.")
+
 tabs = st.tabs(["📄 Table View", "🏷️ Labels", "📊 End of Day Summary"])
 
 # ---- TAB 1 ----
 with tabs[0]:
     if files:
-        items = parse_pdf_files(files)
+        if "parsed_items" not in st.session_state:
+            st.session_state.parsed_items = parse_pdf_files(files)
+        items = st.session_state.parsed_items
         if not items:
             st.warning("No towel line items detected.")
         else:
             df = pd.DataFrame([i.to_row() for i in items])
-            df.index = df.index + 1  # start from 1 instead of 0
+            df.index = df.index + 1
             df.index.name = "No."
             st.dataframe(df, use_container_width=True)
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode("utf-8"), "towel_orders.csv")
@@ -317,23 +327,21 @@ with tabs[0]:
 # ---- TAB 2 ----
 with tabs[1]:
     if files:
-        items = group_items(parse_pdf_files(files))
+        if "parsed_items" not in st.session_state:
+            st.session_state.parsed_items = parse_pdf_files(files)
+        items = group_items(st.session_state.parsed_items)
         if items:
             df = pd.DataFrame([i.to_row() for i in items])
-
             all_ids = [
                 f"{idx+1}. {r['Order ID']} | {r['SKU']} | {r['Font']} | {r['Thread Color']}"
                 for idx, r in df.iterrows()
             ]
-
             key_map = {
                 f"{idx+1}. {i.order_id} | {i.sku_full} | {i.font_name} | {i.thread_color}": i
                 for idx, i in enumerate(items)
             }
-
             selected = st.multiselect("Select items to include:", all_ids, default=all_ids)
             selected_items = [key_map[k] for k in selected if k in key_map]
-
             if st.button("🖨️ Build 4×6 Labels PDF"):
                 pdf_bytes = build_labels_pdf(selected_items)
                 st.download_button("⬇️ Download 4×6 Labels (PDF)", pdf_bytes, "towel_labels_grouped.pdf")
@@ -345,7 +353,9 @@ with tabs[1]:
 # ---- TAB 3 ----
 with tabs[2]:
     if files:
-        items = group_items(parse_pdf_files(files))
+        if "parsed_items" not in st.session_state:
+            st.session_state.parsed_items = parse_pdf_files(files)
+        items = group_items(st.session_state.parsed_items)
         if items:
             df = pd.DataFrame([i.to_row() for i in items])
             st.subheader("📅 End of the Day Summary")
