@@ -13,7 +13,7 @@ from reportlab.lib.utils import simpleSplit
 # ======================================================
 # STREAMLIT CONFIG
 # ======================================================
-st.set_page_config(page_title="Amazon Towels — PDF Parser & 4×6 Labels", layout="wide")
+st.set_page_config(page_title="Amazon Towels — PDF Parser & 4×6 Labels",layout="wide")
 
 # ======================================================
 # CONSTANTS
