@@ -1,15 +1,11 @@
 import io
 import re
-from typing import List, Dict, Any, Tuple
-
 import streamlit as st
-import pdfplumber
-import pandas as pd
 
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import landscape, inch
-from reportlab.lib import colors
-from reportlab.lib.utils import simpleSplit
+st.set_page_config(page_title="Test Clean File", layout="wide")
+
+st.write("✅ Your Streamlit environment is clean and working!")
+
 
 
 # ================================
